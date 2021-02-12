@@ -13,8 +13,10 @@ from aiohttp import web
 from app.objects.c_adversary import Adversary
 from app.objects.c_objective import Objective
 from app.objects.c_operation import Operation
+from app.objects.c_ability import Ability
 from app.objects.c_source import Source
 from app.objects.c_schedule import Schedule
+from app.objects.secondclass.c_link import Link
 from app.objects.secondclass.c_fact import Fact
 from app.service.interfaces.i_rest_svc import RestServiceInterface
 from app.utility.base_service import BaseService
@@ -174,8 +176,15 @@ class RestService(RestServiceInterface, BaseService):
         payload_dirs = [pathlib.Path.cwd() / 'data' / 'payloads']
         payload_dirs.extend(pathlib.Path.cwd() / 'plugins' / plugin.name / 'payloads'
                             for plugin in await self.get_service('data_svc').locate('plugins') if plugin.enabled)
-        return set(p.name for p_dir in payload_dirs for p in p_dir.glob('*')
-                   if p.is_file() and not p.name.startswith('.'))
+        payloads = set()
+        for p_dir in payload_dirs:
+            for p in p_dir.glob('*'):
+                if p.is_file() and not p.name.startswith('.'):
+                    if p.name.endswith('.xored'):
+                        payloads.add(p.name.replace('.xored', ''))
+                    else:
+                        payloads.add(p.name)
+        return payloads
 
     async def find_abilities(self, paw):
         data_svc = self.get_service('data_svc')
@@ -194,6 +203,40 @@ class RestService(RestServiceInterface, BaseService):
     async def apply_potential_link(self, link):
         operation = await self.get_service('app_svc').find_op_with_link(link.id)
         return await operation.apply(link)
+
+    async def add_manual_command(self, access, data):
+        for parameter in ['operation', 'agent', 'executor', 'command']:
+            if parameter not in data.keys():
+                return dict(error='Missing parameter: %s' % parameter)
+
+        try:
+            operation_id = int(data['operation'])
+        except ValueError:
+            return dict(error='Invalid operation ID')
+        operation_search = {'id': operation_id, **access}
+        operation = next(iter(await self.get_service('data_svc').locate('operations', match=operation_search)), None)
+        if not operation:
+            return dict(error='Operation not found')
+
+        agent_search = {'paw': data['agent'], **access}
+        agent = next(iter(await self.get_service('data_svc').locate('agents', match=agent_search)), None)
+        if not agent:
+            return dict(error='Agent not found')
+
+        if data['executor'] not in agent.executors:
+            return dict(error='Agent missing specified executor')
+
+        encoded_command = self.encode_string(data['command'])
+        ability = Ability(ability_id='auto-generated', tactic='auto-generated', technique_id='auto-generated',
+                          technique='auto-generated', name='Manual Command', description='Manual command ability',
+                          cleanup='', test=encoded_command, executor=data['executor'], platform=agent.platform,
+                          payloads=[], parsers=[], requirements=[], privilege=None, variations=[])
+        link = Link.load(dict(command=encoded_command, paw=agent.paw, cleanup=0, ability=ability, score=0, jitter=2,
+                              status=operation.link_status()))
+        link.apply_id(agent.host)
+        operation.add_link(link)
+
+        return dict(link=link.unique)
 
     async def task_agent_with_ability(self, paw, ability_id, obfuscator, facts=()):
         new_links = []
@@ -279,7 +322,8 @@ class RestService(RestServiceInterface, BaseService):
                          group=group, jitter=data.pop('jitter', '2/8'), source=next(iter(sources), None),
                          state=data.pop('state', 'running'), autonomous=int(data.pop('autonomous', 1)), access=allowed,
                          obfuscator=data.pop('obfuscator', 'plain-text'),
-                         auto_close=bool(int(data.pop('auto_close', 0))), visibility=int(data.pop('visibility', '50')))
+                         auto_close=bool(int(data.pop('auto_close', 0))), visibility=int(data.pop('visibility', '50')),
+                         timeout=int(data.pop('timeout', 30)))
 
     def _get_allowed_from_access(self, access):
         if self.Access.HIDDEN in access['access']:
@@ -331,7 +375,8 @@ class RestService(RestServiceInterface, BaseService):
             return copy.deepcopy(adv[0])
         return Adversary.load(dict(adversary_id='ad-hoc', name='ad-hoc', description='an empty adversary profile', atomic_ordering=[]))
 
-    async def _update_global_props(self, sleep_min, sleep_max, watchdog, untrusted, implant_name, bootstrap_abilities):
+    async def _update_global_props(self, sleep_min, sleep_max, watchdog, untrusted, implant_name,
+                                   bootstrap_abilities, deadman_abilities):
         """Update global agent properties
 
         :param sleep_min: Beacon min sleep time (seconds)
@@ -346,6 +391,8 @@ class RestService(RestServiceInterface, BaseService):
         :type implant_name: str
         :param bootstrap_abilities: Comma-separated ability UUIDs
         :type bootstrap_abilities: str
+        :param deadman_abilities: Comma-separated ability UUIDs
+        :type deadman_abilities: str
         """
         self.set_config(name='agents', prop='sleep_min', value=sleep_min)
         self.set_config(name='agents', prop='sleep_max', value=sleep_max)
@@ -353,15 +400,27 @@ class RestService(RestServiceInterface, BaseService):
         self.set_config(name='agents', prop='watchdog', value=watchdog)
         if implant_name:
             self.set_config(name='agents', prop='implant_name', value=implant_name)
-        if bootstrap_abilities:
-            abilities = []
-            ability_ids = [ability_id.strip() for ability_id in bootstrap_abilities.split(',') if ability_id.strip()]
-            for ability_id in ability_ids:
-                if await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id.strip())):
-                    abilities.append(ability_id)
-                else:
-                    self.log.debug('Could not find ability with id "{}" for bootstrap'.format(ability_id))
-            self.set_config(name='agents', prop='bootstrap_abilities', value=abilities)
+        if bootstrap_abilities is not None:
+            await self._update_agent_ability_list_property(bootstrap_abilities, 'bootstrap_abilities')
+
+        if deadman_abilities is not None:
+            await self._update_agent_ability_list_property(deadman_abilities, 'deadman_abilities')
+
+    async def _update_agent_ability_list_property(self, abilities_str, prop_name):
+        """Set the specified agent config property with the specified abilities.
+
+        :param abilities_str: Comma-separated ability UUIDs
+        :type abilities_str: str
+        :param prop_name: name of the configuration property to set (e.g. 'bootstrap_abilities', 'deadman_abilities')
+        :type prop_name: str
+        """
+        abilities = []
+        for ability_id in [ability_id.strip() for ability_id in abilities_str.split(',') if ability_id.strip()]:
+            if await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id.strip())):
+                abilities.append(ability_id)
+            else:
+                self.log.debug('Could not find ability with id "{}" for property "{}"'.format(ability_id, prop_name))
+        self.set_config(name='agents', prop=prop_name, value=abilities)
 
     async def _explode_display_results(self, object_name, results):
         if object_name == 'adversaries':
@@ -370,9 +429,10 @@ class RestService(RestServiceInterface, BaseService):
                                           await self.get_service('data_svc').locate('abilities',
                                                                                     match=dict(ability_id=ab_id))]
                 if adv['objective']:
-                    adv['objective'] = [ob.display for ob in
-                                        await self.get_service('data_svc').locate('objectives',
-                                                                                  match=dict(id=adv['objective']))][0]
+                    objectives = await self.get_service('data_svc').locate('objectives',
+                                                                           match=dict(id=adv['objective']))
+                    if objectives:
+                        adv['objective'] = objectives[0].display
         return results
 
     async def _delete_data_from_memory_and_disk(self, ram_key, identifier, data):
@@ -455,11 +515,12 @@ class RestService(RestServiceInterface, BaseService):
                            'alphanumeric characters, hyphens, and underscores.' % ab.get('id'))
             return []
 
-        # Validate tactic, used for directory creation
+        # Validate tactic, used for directory creation, lower case if present
         if not ab.get('tactic') or not validator.match(ab.get('tactic')):
             self.log.debug('Invalid ability tactic "%s". Tactics can only contain '
                            'alphanumeric characters, hyphens, and underscores.' % ab.get('tactic'))
             return []
+        ab['tactic'] = ab.get('tactic').lower()
 
         # Validate platforms, ability will not be loaded if empty
         if not ab.get('platforms'):
@@ -490,7 +551,8 @@ class RestService(RestServiceInterface, BaseService):
             # Get access
             allowed = self._get_allowed_from_access(access)
 
-        await self.get_service('file_svc').save_file(file_path, yaml.dump([final], encoding='utf-8'), '', encrypt=False)
+        await self.get_service('file_svc').save_file(file_path, yaml.dump([final], encoding='utf-8', sort_keys=False),
+                                                     '', encrypt=False)
         await self.get_service('data_svc').remove('abilities', dict(ability_id=final['id']))
         await self.get_service('data_svc').load_ability_file(file_path, allowed)
         await self._restore_exec_timeouts(final['id'], new_ability_exec_timeouts)
@@ -520,7 +582,8 @@ class RestService(RestServiceInterface, BaseService):
         return [i.display for i in await self.get_service('data_svc').locate(object_class_name, dict(id=final['id']))]
 
     async def _save_and_refresh_item(self, file_path, object_class, final, allowed):
-        await self.get_service('file_svc').save_file(file_path, yaml.dump(final, encoding='utf-8'), '', encrypt=False)
+        await self.get_service('file_svc').save_file(file_path, yaml.dump(final, encoding='utf-8', sort_keys=False),
+                                                     '', encrypt=False)
         await self.get_service('data_svc').load_yaml_file(object_class, file_path, allowed)
 
     async def _prep_new_ability(self, ab):

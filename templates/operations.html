@@ -87,6 +87,9 @@
                     <option value="{{ s.name }}">Use {{ s.name }} facts</option>
                 {% endfor %}
               </select>
+              <p style="margin-bottom:-10px">Cleanup Timeout (secs)</p>
+              <input id="queueTimeout" class="queueOption" type="number" value="30" min="0" max="300"
+                      onchange="stream('The number of seconds Caldera will wait per cleanup action to complete before continuing.')">
           </div>
 
           <div id="stealth" class="sidebar-header">
@@ -159,6 +162,7 @@
       </div>
       <div id="content">
           <span class="op-potential-links" onclick="document.getElementById('potential-modal').style.display='block';">&#10010; potential links</span>
+          <span class="op-manual-commands" onclick="document.getElementById('manual-modal').style.display='block';">&#10010; manual command</span>
           <br>
           <ul id="timeline" class="timeline">
               <li id="time-start">
@@ -206,22 +210,24 @@
     </div>
 </div>
 
-<div id="loop-modal" class="modal section-profile">
-    <form class="modal-content">
-        <div class="container modal-box">
-            <div class="row duk-modal">
-                <div class="column" style="flex:25%">
-                    <p id="hil-linkId"></p>
-                    <h5 id="hil-paw"></h5>
-                    <button class="atomic-button button-success approve" type="button" onclick="submitHilChanges(-3)">Approve</button>
-                    <button class="atomic-button button-embedded discard" type="button" onclick="submitHilChanges(-2)">Discard</button>
-                </div>
-                <div class="column codearea" style="flex:75%">
-                    <textarea id="hil-command" spellcheck="false"></textarea>
+<div id="manual-modal" class="modal">
+    <div class="modal-content" style="width:100%;">
+        <div class="container section-profile row ability-viewer modal-box">
+            <div class="column control-width" style="flex:100%;">
+                <select id="manual-agent" onchange="selectManualAgent();">
+                    <option disabled selected>Choose an agent</option>
+                </select>
+                <div id="manual-command-settings" style="display:none">
+                  <select id="manual-executor"></select>
+                  <input type="text" id="manual-command" placeholder="Run arbitrary command" />
+                  <button id="manual-run" type="button" class="button-success atomic-button" onclick="runManualCommand()">Run</button>
                 </div>
             </div>
+            <div class="imgcontainer">
+                <span onclick="closeManualCommandModal()" class="close" title="Close Modal">&times;</span>
+            </div>
         </div>
-    </form>
+    </div>
 </div>
 
 <li id="potential-link-template" class="potential-links" style="display: none;margin-bottom:-50px">
@@ -270,6 +276,20 @@
     </div>
   </div>
 </li>
+
+<div id="loop-template" class="loop-section" style="display:none">
+    <div style="display:flex">
+        <div class="column" style="flex:15%; margin:5px">
+            <button class="atomic-button button-success approve" type="button" onclick="submitHilChanges(this, -3)" style="margin: 5px">Approve</button>
+            <button class="atomic-button button-embedded discard" type="button" onclick="submitHilChanges(this, -2)" style="margin: 5px;margin-bottom: 15px">Discard</button>
+        </div>
+        <div class="column codearea" style="flex:85%; margin:5px">
+            <p class="hil-linkId" style="display:none"></p>
+            <div class="hil-command" role="textbox" contenteditable spellcheck="false"></div>
+        </div>
+    </div>
+</div>
+
 <script>
     let refresher = setInterval(refresh, 10000);
     $('.section-profile').bind('destroyed', function() {
@@ -314,6 +334,7 @@
     }
 
     function handleStartAction(){
+        $('.op-selected').css('visibility', 'hidden');
         restRequest('PUT', buildOperationObject(), handleStartActionCallback);
     }
 
@@ -381,7 +402,8 @@
             "auto_close": document.getElementById("queueAutoClose").value,
             "jitter":jitter,
             "source":document.getElementById("queueSource").value,
-            "visibility": document.getElementById("queueVisibility").value
+            "visibility": document.getElementById("queueVisibility").value,
+            "timeout": document.getElementById("queueTimeout").value
         };
     }
 
@@ -439,14 +461,8 @@
             $('#currentObfuscation').val(OPERATION.obfuscator);
             applyOperationAgents(OPERATION);
             clearTimeline();
-            for(let i=0; i<OPERATION.chain.length; i++){
-                if(OPERATION.chain[i].status === -1) {
-                    $('#hil-linkId').html(OPERATION.chain[i].unique);
-                    $('#hil-paw').html(OPERATION.chain[i].paw);
-                    $('#hil-command').html(atob(OPERATION.chain[i].command));
-                    document.getElementById("loop-modal").style.display = "block";
-                    return;
-                } else if($("#op_id_" + OPERATION.chain[i].id).length === 0) {
+            for (let i=0; i<OPERATION.chain.length; i++) {
+                if ($("#op_id_" + OPERATION.chain[i].id).length === 0) {
                     let template = $("#link-template").clone();
                     let title = OPERATION.chain[i].ability.name;
                     if(OPERATION.chain[i].cleanup) {
@@ -462,13 +478,27 @@
                         title + '<span id="'+OPERATION.chain[i].id+'-rs" class="tactic-find-result" ' +
                         'onclick="findResults(this,'+lnk+')"' +
                         'data-encoded-cmd="'+OPERATION.chain[i].command+'"></span>' +
-                        '<span id="'+OPERATION.chain[i].id+'-rm" style="font-size:11px;float:right;" onclick="updateLinkStatus2('+lnk+','+OPERATION.id+', -2)">&#x274C;</span>' +
-                        '<span id="'+OPERATION.chain[i].id+'-add" style="font-size:22px;float:right;" onclick="updateLinkStatus2('+lnk+','+OPERATION.id+',-3)">&#x002B;</span></div>');
+                        '<span id="'+OPERATION.chain[i].id+'-rm" style="font-size:11px;float:right;cursor:pointer;margin-left:5px" onclick="updateLinkStatus2('+lnk+','+OPERATION.id+', -2)">&#x274C;</span>' +
+                        '<img id="'+OPERATION.chain[i].id+'-cm" src="/gui/img/duk.png" style="height: 20px;border: none;float: right;cursor: pointer;margin-right: .14em" onclick="showCommand(\''+OPERATION.chain[i].command+'\')"/>' +
+                        '<span id="'+OPERATION.chain[i].id+'-add" style="font-size:22px;float:right;cursor:pointer;" onclick="updateLinkStatus2('+lnk+','+OPERATION.id+',-3)">&#x002B;</span></div>');
+
+                    if (OPERATION.chain[i].status === -1) {
+                        let loop_template = $("#loop-template").clone();
+                        loop_template.removeAttr('id');
+                        loop_template.find('.hil-linkId').html(OPERATION.chain[i].unique);
+                        loop_template.find('.hil-command').html(atob(OPERATION.chain[i].command));
+                        loop_template.css('display', 'block');
+                        loop_template.insertAfter(template.find(".member-infos"));
+                        template.find('#'+OPERATION.chain[i].id+'-rm').remove();
+                        template.find('#'+OPERATION.chain[i].id+'-cm').remove()
+                    }
+
                     refreshUpdatableFields(OPERATION.chain[i], template, true);
 
                     template.insertAfter("#time-start");
                     $(template.find("#inner-contents")).slideUp();
                     template.show();
+
                 } else {
                     let existing = $("#op_id_"+OPERATION.chain[i].id);
                     refreshUpdatableFields(OPERATION.chain[i], existing);
@@ -520,6 +550,12 @@
                         .attr("value", 'agent-'+paw)
                         .text(operation.host_group[i].display_name + '-'+operation.host_group[i].paw));
             }
+            if($("#manual-agent option[value='" + paw + "'").length === 0){
+                 $('#manual-agent').append($("<option></option>")
+                        .attr('value', paw)
+                        .text(operation.host_group[i].display_name + '-'+operation.host_group[i].paw)
+                        .data('executors', operation.host_group[i].executors));
+            }
         }
     }
 
@@ -547,12 +583,12 @@
             if(!(techniqueFilter === '-- any --' || typeof techniqueFilter === 'undefined') && !(techniqueFilter === ("technique-"+link.ability.technique_id)))
                 continue;/**/
             template.attr('id', uniqueLinkId);
-            template.find('#potential-name').html(link.ability.name);
-            template.find('#potential-technique').html(link.ability.technique_id+' - '+link.ability.technique_name+' ('+link.ability.tactic+')')
-            template.find('#potential-description').html(link.ability.description);
-            template.find('#potential-command').html(atob(link.command));
-            template.find('#potential-score').html(link.score);
-            template.find('#potential-visibility').html(link.visibility.score);
+            template.find('#potential-name').text(link.ability.name);
+            template.find('#potential-technique').text(link.ability.technique_id+' - '+link.ability.technique_name+' ('+link.ability.tactic+')')
+            template.find('#potential-description').text(link.ability.description);
+            template.find('#potential-command').text(atob(link.command));
+            template.find('#potential-score').text(link.score);
+            template.find('#potential-visibility').text(link.visibility.score);
             template.data('link', link);
             template.show();
             if($("#potential-link-tactic-filter option[value='tactic-"+link.ability.tactic+"'").length === 0){
@@ -606,6 +642,57 @@
         $('#potential-links-count').html($('#potential-links li').length + ' potential links');
     }
 
+    function selectManualAgent() {
+        $('#manual-executor').empty();
+        let executorShells = {
+            'psh': 'PS >',
+            'cmd': '>',
+            'sh': '$'
+        };
+        $.each($('#manual-agent option:selected').data('executors'), function(index, executor) {
+            if (executor in executorShells) {
+                var newOption = $('<option></option>')
+                                .attr('value', executor)
+                                .text(executorShells[executor]);
+                                $('#manual-executor').append(newOption);
+            }
+        });
+        $('#manual-command-settings').show();
+    }
+
+    function closeManualCommandModal() {
+        $('#manual-modal').hide();
+        $('#manual-agent-filter').prop('selectedIndex', 0);
+        $('#manual-command-settings').hide();
+    }
+
+    function runManualCommand() {
+        function runManualCommandCallback(data) {
+            if (data['error']) {
+                stream('Error running manual command: ' + data['error']);
+            } else {
+                stream('Manual command queued');
+                $('#manual-command').val('');
+            }
+            $('#manual-run').addClass('button-success').removeClass('button-notready');
+        }
+        let agent = $('#manual-agent').val();
+        let operation = $('#operation-list').val();
+        let executor = $('#manual-executor').val();
+        let command = $('#manual-command').val();
+        if (agent !== null && operation !== null && executor !== null && command !== '') {
+            $('#manual-run').addClass('button-notready').removeClass('button-success');
+            let request = {
+                'index': 'manual_command',
+                'agent': agent,
+                'operation': operation,
+                'executor': executor,
+                'command': command
+            };
+            restRequest('PUT', request, runManualCommandCallback);
+        }
+    }
+
     function refreshUpdatableFields(chain, div, newEntry=false){
         if(chain.status !== -5) {
             div.find('#'+chain.id+'-add').remove();
@@ -623,6 +710,7 @@
                 resultStar.addClass('tactic-no-facts');
             }
             div.find('#'+chain.id+'-rm').remove();
+            div.find('#'+chain.id+'-cm').remove();
         }
         if(chain.status === 0) {
             applyTimelineColor(div, 'success');
@@ -692,17 +780,18 @@
         modal.find('#resultView').text('');
     }
 
-    function submitHilChanges(status){
-        document.getElementById("loop-modal").style.display = "none";
-        let command = $('#hil-command').val();
-        updateLinkStatus($('#hil-linkId').html(), status, btoa(command));
+    function submitHilChanges(link_button, status){
+        link_loop = $(link_button).parent().parent();
+        let command = $(link_loop).find('.hil-command').val();
+        updateLinkStatus($(link_loop).find('.hil-linkId').html(), status, btoa(command));
+        $(link_loop).parent().parent().remove();
         refresh();
         return false;
     }
 
     function updateLinkStatus2(lnk, op_id, status) {
-        let data = {'index':'chain', 'link_id': op_id+'-'+lnk, 'status': status};
-        restRequest('PUT', data, doNothing);
+        let data = {'index':'chain', 'link_id': lnk, 'status': status};
+        restRequest('PUT', data, refresh);
     }
 
     function updateLinkStatus(lnk, status, command='') {
@@ -724,6 +813,11 @@
         if ($('#togBtnOp').is(':checked')) {
             $('#opBtn').addClass('separated-button');
         }
+    }
+
+    function showCommand(command){
+        document.getElementById('more-modal').style.display='block';
+        $('#resultCmd').html(atob(command));
     }
     //# sourceURL=operations.js
 </script>

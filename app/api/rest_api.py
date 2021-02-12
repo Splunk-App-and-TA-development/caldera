@@ -60,7 +60,7 @@ class RestApi(BaseWorld):
         if not access:
             return render_template('login.html', request, dict())
         plugins = await self.data_svc.locate('plugins', {'access': tuple(access), **dict(enabled=True)})
-        data = dict(plugins=[p.display for p in plugins], errors=self.app_svc.errors + self._request_errors(request), version=self.app_svc.version)
+        data = dict(plugins=[p.display for p in plugins], errors=self.app_svc.errors + self._request_errors(request))
         return render_template('%s.html' % access[0].name, request, data)
 
     """ API ENDPOINTS """
@@ -88,7 +88,8 @@ class RestApi(BaseWorld):
                     chain=lambda d: self.rest_svc.update_chain_data(d),
                     operations=lambda d: self.rest_svc.create_operation(access, d),
                     schedule=lambda d: self.rest_svc.create_schedule(access, d),
-                    link=lambda d: self.rest_svc.apply_potential_link(Link.load(d))
+                    link=lambda d: self.rest_svc.apply_potential_link(Link.load(d)),
+                    manual_command=lambda d: self.rest_svc.add_manual_command(access, d)
                 ),
                 POST=dict(
                     operation_report=lambda d: self.rest_svc.display_operation_report(d),

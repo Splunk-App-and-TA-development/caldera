@@ -44,29 +44,32 @@ class BasePlanningService(BaseService):
         :param rules:
         :return: updated list of links
         """
+        link_variants = []
         for link in links:
             decoded_test = agent.replace(link.command, file_svc=self.get_service('file_svc'))
             variables = re.findall(self.re_variable, decoded_test)
             if variables:
-                relevant_facts = await self._build_relevant_facts(variables, facts)
-                good_facts = await RuleSet(rules=rules).apply_rules(facts=relevant_facts[0])
-                valid_facts = await self._trim_by_limit(decoded_test, good_facts)
-                for combo in list(itertools.product(*valid_facts)):
-                    try:
-                        copy_test = copy.copy(decoded_test)
-                        copy_link = copy.deepcopy(link)
-                        variant, score, used = await self._build_single_test_variant(copy_test, combo, link.ability.executor)
-                        copy_link.command = self.encode_string(variant)
-                        copy_link.score = score
-                        copy_link.used.extend(used)
-                        copy_link.apply_id(agent.host)
-                        links.append(copy_link)
-                    except Exception as ex:
-                        logging.error('Could not create test variant: %s.\nLink=%s' % (ex, link.__dict__))
+                relevant_facts = await self._build_relevant_facts([x for x in variables if len(x.split('.')) > 2],
+                                                                  facts)
+                if all(relevant_facts):
+                    good_facts = [await RuleSet(rules=rules).apply_rules(facts=fact_set) for fact_set in relevant_facts]
+                    valid_facts = [await self._trim_by_limit(decoded_test, g_fact[0]) for g_fact in good_facts]
+                    for combo in list(itertools.product(*valid_facts)):
+                        try:
+                            copy_test = copy.copy(decoded_test)
+                            copy_link = copy.deepcopy(link)
+                            variant, score, used = await self._build_single_test_variant(copy_test, combo, link.ability.executor)
+                            copy_link.command = self.encode_string(variant)
+                            copy_link.score = score
+                            copy_link.used.extend(used)
+                            copy_link.apply_id(agent.host)
+                            link_variants.append(copy_link)
+                        except Exception as ex:
+                            logging.error('Could not create test variant: %s.\nLink=%s' % (ex, link.__dict__))
             else:
                 link.apply_id(agent.host)
                 link.command = self.encode_string(decoded_test)
-        return links
+        return links + link_variants
 
     @staticmethod
     async def remove_completed_links(operation, agent, links):
@@ -78,10 +81,13 @@ class BasePlanningService(BaseService):
         :param agent:
         :return: updated list of links
         """
-        completed_links = [(l.command_hash if l.command_hash else l.command) for l in operation.chain
-                           if l.paw == agent.paw and (l.finish or l.can_ignore())]
-        return [l for l in links if l.ability.repeatable or
-                (l.command_hash if l.command_hash else l.command) not in completed_links]
+        completed_links = [lnk for lnk in operation.chain if lnk.paw == agent.paw and (lnk.finish or lnk.can_ignore())]
+
+        singleton_links = BasePlanningService._list_historic_duplicate_singletons(operation)
+
+        return [lnk for lnk in links if lnk.ability.repeatable or
+                (lnk not in completed_links and
+                 not any([lnk.command == x.command for x in singleton_links]))]
 
     @staticmethod
     async def remove_links_missing_facts(links):
@@ -114,6 +120,38 @@ class BasePlanningService(BaseService):
     """ PRIVATE """
 
     @staticmethod
+    def _list_historic_duplicate_singletons(operation):
+        """
+        Generate a list of successfully run singleton abilities for a given operation
+        :param operation: Operation to scan
+        :return: List of command hashes for succeeded singleton abilities
+        """
+        singleton = [k for k in operation.chain if k.status == k.states['SUCCESS'] and k.ability.singleton]
+        return [x for x in singleton if x]
+
+    @staticmethod
+    def _remove_links_of_duplicate_singletons(agent_links):
+        """
+        Filter links across agents
+        :param agent_links: array of agent links
+        :return: Flattened, filtered list of links
+        """
+
+        links = []
+        parallel_list = []
+        for agent_list in agent_links:
+            for individual_link in agent_list:
+                if not individual_link.ability.singleton:
+                    links.append(individual_link)
+                else:
+                    compare = (individual_link.command_hash if individual_link.command_hash else
+                               individual_link.command)
+                    if compare not in parallel_list:
+                        parallel_list.append(compare)
+                        links.append(individual_link)
+        return links
+
+    @staticmethod
     async def _build_single_test_variant(copy_test, combo, executor):
         """
         Replace all variables with facts from the combo to build a single test variant
@@ -134,6 +172,8 @@ class BasePlanningService(BaseService):
     async def _build_relevant_facts(variables, facts):
         """
         Create a list of facts which are relevant to the given ability's defined variables
+
+        Returns: (list) of lists, with each inner list providing all known values for the corresponding fact trait
         """
         relevant_facts = []
         for v in variables:
@@ -158,14 +198,15 @@ class BasePlanningService(BaseService):
     async def _trim_by_limit(self, decoded_test, facts):
         limited_facts = []
         for limit in re.findall(self.re_limited, decoded_test):
-            limited = copy.deepcopy(facts[0])
+            limited = copy.deepcopy(facts)
             trait = re.search(self.re_trait, limit).group(0)
 
             limit_definitions = re.search(self.re_index, limit).group(0)
             if limit_definitions:
                 for limiter in limit_definitions.split(','):
                     limited = self._apply_limiter(trait=trait, limiter=limiter.split('='), facts=limited)
-            limited_facts.append(limited)
+            if limited:
+                limited_facts.append(limited[0])
         if limited_facts:
             return limited_facts
         return facts

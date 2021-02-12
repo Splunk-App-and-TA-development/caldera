@@ -113,6 +113,7 @@ class DataService(DataServiceInterface, BaseService):
                 ability_name = ab.pop('name', '')
                 privilege = ab.pop('privilege', None)
                 repeatable = ab.pop('repeatable', False)
+                singleton = ab.pop('singleton', False)
                 requirements = ab.pop('requirements', [])
                 for platforms, executors in ab.pop('platforms', dict()).items():
                     for name, info in executors.items():
@@ -131,6 +132,7 @@ class DataService(DataServiceInterface, BaseService):
                         else:
                             encoded_code = None
                         payloads = ab.pop('payloads', []) if encoded_code else info.get('payloads')
+                        uploads = ab.pop('uploads', []) if encoded_code else info.get('uploads')
                         for e in name.split(','):
                             for pl in platforms.split(','):
                                 a = await self._create_ability(ability_id=ability_id, tactic=tactic,
@@ -141,12 +143,14 @@ class DataService(DataServiceInterface, BaseService):
                                                                cleanup=cleanup_cmd, code=encoded_code,
                                                                language=info.get('language'),
                                                                build_target=info.get('build_target'),
-                                                               payloads=payloads, parsers=info.get('parsers', []),
+                                                               payloads=payloads, uploads=uploads,
+                                                               parsers=info.get('parsers', []),
                                                                timeout=info.get('timeout', 60),
                                                                requirements=requirements, privilege=privilege,
                                                                buckets=await self._classify(ab, tactic),
                                                                access=access, repeatable=repeatable,
-                                                               variations=info.get('variations', []), **ab)
+                                                               variations=info.get('variations', []),
+                                                               singleton=singleton, **ab)
                                 await self._update_extensions(a)
 
     async def load_adversary_file(self, filename, access):
@@ -171,19 +175,21 @@ class DataService(DataServiceInterface, BaseService):
 
     async def _load(self, plugins=()):
         try:
+            async_tasks = []
             if not plugins:
                 plugins = [p for p in await self.locate('plugins') if p.data_dir and p.enabled]
+            if not [plugin for plugin in plugins if plugin.data_dir == 'data']:
                 plugins.append(Plugin(data_dir='data'))
             for plug in plugins:
                 await self._load_payloads(plug)
-                await self._load_abilities(plug)
+                await self._load_abilities(plug, async_tasks)
                 await self._load_objectives(plug)
-                await self._load_packers(plug)
-            await self._verify_ability_set()
-            for plug in plugins:
                 await self._load_adversaries(plug)
-                await self._load_sources(plug)
                 await self._load_planners(plug)
+                await self._load_sources(plug)
+                await self._load_packers(plug)
+            for task in async_tasks:
+                await task
             await self._load_extensions()
             await self._verify_data_sets()
         except Exception as e:
@@ -193,9 +199,10 @@ class DataService(DataServiceInterface, BaseService):
         for filename in glob.iglob('%s/adversaries/**/*.yml' % plugin.data_dir, recursive=True):
             await self.load_yaml_file(Adversary, filename, plugin.access)
 
-    async def _load_abilities(self, plugin):
+    async def _load_abilities(self, plugin, tasks=None):
+        tasks = [] if tasks is None else tasks
         for filename in glob.iglob('%s/abilities/**/*.yml' % plugin.data_dir, recursive=True):
-            asyncio.get_event_loop().create_task(self.load_ability_file(filename, plugin.access))
+            tasks.append(asyncio.get_event_loop().create_task(self.load_ability_file(filename, plugin.access)))
 
     async def _update_extensions(self, ability):
         for ab in await self.locate('abilities', dict(name=None, ability_id=ability.ability_id)):
@@ -250,7 +257,8 @@ class DataService(DataServiceInterface, BaseService):
     async def _create_ability(self, ability_id, tactic=None, technique_name=None, technique_id=None, name=None,
                               test=None, description=None, executor=None, platform=None, cleanup=None, payloads=None,
                               parsers=None, requirements=None, privilege=None, timeout=60, access=None, buckets=None,
-                              repeatable=False, code=None, language=None, build_target=None, variations=None, **kwargs):
+                              repeatable=False, code=None, language=None, build_target=None, variations=None,
+                              singleton=False, uploads=None, **kwargs):
         ps = []
         for module in parsers:
             ps.append(Parser.load(dict(module=module, parserconfigs=parsers[module])))
@@ -261,9 +269,9 @@ class DataService(DataServiceInterface, BaseService):
         ability = Ability(ability_id=ability_id, name=name, test=test, tactic=tactic,
                           technique_id=technique_id, technique=technique_name, code=code, language=language,
                           executor=executor, platform=platform, description=description, build_target=build_target,
-                          cleanup=cleanup, payloads=payloads, parsers=ps, requirements=rs,
+                          cleanup=cleanup, payloads=payloads, uploads=uploads, parsers=ps, requirements=rs,
                           privilege=privilege, timeout=timeout, repeatable=repeatable,
-                          variations=variations, buckets=buckets, **kwargs)
+                          variations=variations, buckets=buckets, singleton=singleton, **kwargs)
         ability.access = access
         return await self.store(ability)
 
@@ -290,44 +298,40 @@ class DataService(DataServiceInterface, BaseService):
             await self.get_service('file_svc').add_special_payload(k, getattr(self.get_service(v['service']),
                                                                               v['function']))
 
-    async def _verify_ability_set(self):
-        payload_cleanup = await self.get_service('data_svc').locate('abilities', dict(ability_id='4cd4eb44-29a7-4259-91ae-e457b283a880'))
-        for existing in await self.locate('abilities'):
-            if not existing.name:
-                existing.name = '(auto-generated)'
-                self.log.warning('Fix name for ability: %s' % existing.ability_id)
-            if not existing.description:
-                existing.description = '(auto-generated)'
-                self.log.warning('Fix description for ability: %s' % existing.ability_id)
-            if not existing.tactic:
-                existing.tactic = '(auto-generated)'
-                self.log.warning('Fix tactic for ability: %s' % existing.ability_id)
-            if not existing.technique_id:
-                existing.technique_id = '(auto-generated)'
-                self.log.warning('Fix technique ID for ability: %s' % existing.ability_id)
-            if not existing.technique_name:
-                existing.technique_name = '(auto-generated)'
-                self.log.warning('Fix technique name for ability: %s' % existing.ability_id)
-            for payload in existing.payloads:
+    async def _verify_data_sets(self):
+        await self._verify_abilities()
+        await self._verify_default_objective_exists()
+        await self._verify_adversary_profiles()
+
+    async def _verify_abilities(self):
+        required_fields = ['name', 'description', 'tactic', 'technique_id', 'technique_name']
+        special_extensions = [special_payload for special_payload in
+                              self.get_service('file_svc').special_payloads if special_payload.startswith('.')]
+        cleanup_abilities = await self.locate('abilities', dict(ability_id='4cd4eb44-29a7-4259-91ae-e457b283a880'))
+        for ability in await self.locate('abilities'):
+            for field in required_fields:
+                if not getattr(ability, field):
+                    setattr(ability, field, '(auto-generated)')
+                    self.log.warning('Missing required field in ability %s: %s' % (ability.ability_id, field))
+            for payload in ability.payloads:
                 payload_name = payload
                 if self.is_uuid4(payload):
                     payload_name, _ = self.get_service('file_svc').get_payload_name_from_uuid(payload)
+                if any(payload_name.endswith(extension) for extension in special_extensions) or \
+                        (ability.code and payload_name == ability.build_target):
+                    continue
                 _, path = await self.get_service('file_svc').find_file_path(payload_name)
                 if not path:
-                    self.log.warning('Payload referenced in %s but not found: %s' % (existing.ability_id, payload))
+                    self.log.warning('Payload referenced in %s but not found: %s' % (ability.ability_id, payload))
                     continue
-                for clean_ability in [a for a in payload_cleanup if a.executor == existing.executor]:
+                for cleanup_ability in [a for a in cleanup_abilities if a.executor == ability.executor]:
                     if self.is_uuid4(payload):
-                        decoded_test = existing.replace_cleanup(clean_ability.cleanup[0], '#{payload:%s}' % payload)
-                    else:  # Explain why the else is here
-                        decoded_test = existing.replace_cleanup(clean_ability.cleanup[0], payload)
-                    cleanup_command = self.encode_string(decoded_test)
-                    if cleanup_command not in existing.cleanup:
-                        existing.cleanup.append(cleanup_command)
-
-    async def _verify_data_sets(self):
-        await self._verify_default_objective_exists()
-        await self._verify_adversary_profiles()
+                        decoded_command = ability.replace_cleanup(cleanup_ability.cleanup[0], '#{payload:%s}' % payload)
+                    else:
+                        decoded_command = ability.replace_cleanup(cleanup_ability.cleanup[0], payload)
+                    cleanup_command = self.encode_string(decoded_command)
+                    if cleanup_command not in ability.cleanup:
+                        ability.cleanup.append(cleanup_command)
 
     async def _verify_default_objective_exists(self):
         if not await self.locate('objectives', match=dict(name='default')):
@@ -338,3 +342,8 @@ class DataService(DataServiceInterface, BaseService):
         for adv in await self.locate('adversaries'):
             if not adv.objective:
                 adv.objective = '495a9828-cab1-44dd-a0ca-66e58177d8cc'
+            if not next((objective for objective in self.ram['objectives'] if objective.id == adv.objective), None):
+                self.log.warning('Objective referenced in %s but not found: %s' % (adv.adversary_id, adv.objective))
+            for ability_id in adv.atomic_ordering:
+                if not next((ability for ability in self.ram['abilities'] if ability.ability_id == ability_id), None):
+                    self.log.warning('Ability referenced in %s but not found: %s' % (adv.adversary_id, ability_id))

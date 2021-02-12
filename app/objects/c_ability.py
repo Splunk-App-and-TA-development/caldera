@@ -22,6 +22,7 @@ class AbilitySchema(ma.Schema):
     executor = ma.fields.String(missing=None)
     platform = ma.fields.String(missing=None)
     payloads = ma.fields.List(ma.fields.String(), missing=None)
+    uploads = ma.fields.List(ma.fields.String(), missing=None)
     parsers = ma.fields.List(ma.fields.Nested(ParserSchema), missing=None)
     requirements = ma.fields.List(ma.fields.Nested(RequirementSchema), missing=None)
     privilege = ma.fields.String(missing=None)
@@ -35,6 +36,7 @@ class AbilitySchema(ma.Schema):
     additional_info = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.String())
     access = ma.fields.Nested(AccessSchema, missing=None)
     test = ma.fields.String(missing=None)
+    singleton = ma.fields.Bool(missing=None)
 
     @ma.post_load
     def build_ability(self, data, **_):
@@ -46,7 +48,8 @@ class AbilitySchema(ma.Schema):
 class Ability(FirstClassObjectInterface, BaseObject):
 
     schema = AbilitySchema()
-    display_schema = AbilitySchema(exclude=['repeatable', 'language', 'code', 'build_target'])  # may need to fix for id=self.unique
+    # may need to fix for id=self.unique
+    display_schema = AbilitySchema(exclude=['repeatable', 'language', 'code', 'build_target', 'singleton'])
 
     RESERVED = dict(payload='#{payload}')
     HOOKS = dict()
@@ -70,11 +73,12 @@ class Ability(FirstClassObjectInterface, BaseObject):
     def __init__(self, ability_id, tactic=None, technique_id=None, technique=None, name=None, test=None,
                  description=None, cleanup=None, executor=None, platform=None, payloads=None, parsers=None,
                  requirements=None, privilege=None, timeout=60, repeatable=False, buckets=None, access=None,
-                 variations=None, language=None, code=None, build_target=None, additional_info=None, tags=None, **kwargs):
+                 variations=None, language=None, code=None, build_target=None, additional_info=None, tags=None,
+                 singleton=False, uploads=None, **kwargs):
         super().__init__()
         self._test = test
         self.ability_id = ability_id
-        self.tactic = tactic
+        self.tactic = tactic.lower() if tactic else None
         self.technique_name = technique
         self.technique_id = technique_id
         self.name = name
@@ -84,6 +88,7 @@ class Ability(FirstClassObjectInterface, BaseObject):
         self.platform = platform
         self.payloads = payloads if payloads else []
         self.parsers = parsers if parsers else []
+        self.uploads = uploads if uploads else []
         self.requirements = requirements if requirements else []
         self.privilege = privilege
         self.timeout = timeout
@@ -93,6 +98,7 @@ class Ability(FirstClassObjectInterface, BaseObject):
         self.build_target = build_target
         self.variations = get_variations(variations)
         self.buckets = buckets if buckets else []
+        self.singleton = singleton
         if access:
             self.access = self.Access(access)
         self.additional_info = additional_info or dict()
@@ -120,6 +126,7 @@ class Ability(FirstClassObjectInterface, BaseObject):
         existing.update('executor', self.executor)
         existing.update('platform', self.platform)
         existing.update('payloads', self.payloads)
+        existing.update('uploads', self.uploads)
         existing.update('privilege', self.privilege)
         existing.update('timeout', self.timeout)
         existing.update('code', self.code)

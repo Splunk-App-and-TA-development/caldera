@@ -31,10 +31,6 @@ class AppService(AppServiceInterface, BaseService):
         self.log = self.add_service('app_svc', self)
         self.loop = asyncio.get_event_loop()
         self._errors = []
-        self.version = self.get_version()
-        if not self.version:
-            self._errors.append(Error('core', 'code is not a release version'))
-            self.version = 'no version'
 
     async def start_sniffer_untrusted_agents(self):
         next_check = self.get_config(name='agents', prop='untrusted_timer')
@@ -105,8 +101,6 @@ class AppService(AppServiceInterface, BaseService):
             if plugin.name in self.get_config('plugins'):
                 await plugin.enable(self.get_services())
                 self.log.info('Enabled plugin: %s' % plugin.name)
-                if not plugin.version:
-                    self._errors.append(Error(plugin.name, 'plugin code is not a release version'))
 
         for plug in filter(trim, plugins):
             if not os.path.isdir('plugins/%s' % plug) or not os.path.isfile('plugins/%s/hook.py' % plug):
@@ -200,6 +194,6 @@ class AppService(AppServiceInterface, BaseService):
     @staticmethod
     def _check_links_for_match(unique, links):
         for ll in links:
-            exists = next((link for link in ll if link.unique == unique), None)
+            exists = next((link for link in ll if link.unique == str(unique)), None)
             if exists:
                 return exists
